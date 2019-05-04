@@ -3,9 +3,10 @@
 var config = require('./config.js');
 
 const RingApi = require('ring-api');
-var ringApi = RingApi;
-
 const BlynkLib = require('blynk-library');
+const execSync = require('child_process').execSync;
+
+var ringApi = RingApi;
 var blynk = BlynkLib;
 var blynk_bridge_entrance;
 var blynk_button_auto_open;
@@ -31,8 +32,11 @@ async function ring_connect() {
 
 // handle Ring activity events, such as doorbell rings ("dings") or detected motion
 var got_ring_activity = async function (activity) {
-    // uncomment to dump activity event info
-    //console.log("Activity detected:\n", activity);
+    // uncomment to dump verbose activity event info;
+    //console.log("Activity detected:\n", activity
+
+    var human_date = new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+    console.log("⚠️  Activity detected at " + human_date);
 
     if (activity.kind == "ding") {
         console.log("Ring got a ding")
@@ -92,39 +96,77 @@ async function blynk_connect() {
     console.log('Connected to Blynk');
 }
 
-// request to capture a still image from the front entrace camera by hitting the backend service
-async function request_image_capture_from_external_camera() {
-    var filename;
-    console.log("Requesting still image from remote camera");
+// synchronously execs a command and logs what was done
+function exec_with_log(command) {
+    //console.log('execing: ' + command);
 
-    const http = require('http');
-    http.get(config.external_camera_capture_url, (resp) => {
-        let data = '';
+    return (execSync(command).toString());
+}
 
-        resp.on('data', (chunk) => {
-            data += chunk;
-        });
+// captures a still image from an RTSP stream, uploads it to S3, and sets a Blynk Image widget to its URL
+async function capture_front_door_image() {
+    var iso_date = new Date().toISOString();
+    var human_date = new Date().toLocaleString("en-US", { timeZone: "America/Los_Angeles" });
+    var entrance_capture_filename = config.entrance_capture_dir + iso_date + '.jpg'
+    //var sudo = ''; // if running local
+    var sudo = 'sudo -u ubuntu'; // if running on Linux
+
+    // catch and ignore shell errors, as these are
+    try {
+        // capture a still image from the RTSP stream
+        // TODO move crop setting to config
+        exec_with_log('ffmpeg -rtsp_transport tcp -loglevel fatal -i "' + config.rtsp_url + '" -vframes 1 -r 1 -filter:v "crop=745:375:500:165" ' + entrance_capture_filename);
+
+        var s3_url = 's3://' + config.s3_bucket + "/" + config.s3_dir + "/" + iso_date + ".jpg";
+        console.log("S3 URL for static camera image: " + s3_url);
+
+        // copy image to S3
+        exec_with_log(sudo + ' aws s3 cp ' + entrance_capture_filename + ' ' + s3_url);
 
         // parse out the filename of the newly-created image and set the image widget to the S3 URL of the image
-        resp.on('end', () => {
-            filename = JSON.parse(data).filename;
+        var image_url = config.s3_url + "/" + config.s3_bucket + "/" + config.s3_dir + "/" + iso_date + ".jpg";
+        console.log('Setting image URL to ' + image_url);
+        blynk.setProperty(config.blynk_pin_image, "urls", image_url);
+        blynk.virtualWrite(config.blynk_pin_image, 1);
 
-            var url = config.s3_url + "/" + config.s3_bucket + "/" + config.s3_dir + "/" + filename + ".jpg";
-            console.log("S3 URL for static camera image: " + url);
+        // also set the timestamp in the Blynk app
+        blynk.virtualWrite(config.blynk_pin_timestamp, human_date);
+    }
+    catch (err) {
+        console.log("Couldn't capture image or send to S3");
+    }
 
-            blynk.setProperty(config.blynk_pin_image, "url", 1, url);
-            blynk.virtualWrite(config.blynk_pin_image, 1);
-        });
-    }).on("error", (err) => {
-        console.log("HTTP error: " + err.message);
-    });
+    try {
+        // mail the uuencoded image in an attachment
+        // TODO: can do this async
+        exec_with_log('uuencode ' + entrance_capture_filename + ' entrance-capture.jpg | mail -r ' + config.ring_account + ' -s "Someone rang the doorbell at ' + iso_date + '" ' + config.ring_account);
+    }
+    catch (err) {
+        console.log("Couldn't mail image");
+    }
+
+    try {
+        // run it through AWS rekognition and capture the output
+        //iso_date ='2019-01-04-18-03-39'; // uncomment for test file
+        var stdout = exec_with_log(sudo + ' aws rekognition detect-faces --image "S3Object={Bucket=' + config.s3_bucket + ',Name=' + config.s3_dir + '/' + iso_date + '.jpg}" --attributes ALL --region us-west-2');
+        var faces_data = JSON.parse(stdout);
+        var gender = faces_data.FaceDetails[0].Gender.Value.toLowerCase();
+        var age_low = faces_data.FaceDetails[0].AgeRange.Low;
+        var age_high = faces_data.FaceDetails[0].AgeRange.High;
+        var description = `${gender} age ${age_low}-${age_high}`;
+
+        console.log(`Detected ${description}`);
+        blynk.virtualWrite(config.blynk_pin_face_description, description);
+    }
+    catch (err) {
+        console.log("Couldn't recognize faces or exec Rekognition");
+
+        blynk.virtualWrite(config.blynk_pin_face_description, "(undetected)");
+    }
 }
 
 // handle doorbell ring events with Blynk logic to open a gate
 async function doorbell_rung() {
-    // asynchronously request a capture of the front camera image
-    if (config.external_camera_capture_url) { request_image_capture_from_external_camera() };
-
     // TODO: wrap logs in function that sends to common Blynk terminal as well
     console.log("Setting doorbell state button")
     blynk.virtualWrite(config.blynk_pin_doorbell_state, 1);  // turn doorbell state button to On
@@ -162,6 +204,9 @@ async function doorbell_rung() {
             blynk_bridge_entrance.virtualWrite(config.blynk_pin_open_gate, 0);
         }, (config.push_gate_button_delay + config.push_gate_button_duration) * 1000);
     }
+
+    console.log("Capturing and analyzing front door image");
+    capture_front_door_image();
 }
 
 // connect to APIs
