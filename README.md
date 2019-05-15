@@ -1,6 +1,9 @@
 # ring-blynk
 This Node.js app interfaces with a Ring video doorbell to send doorbell rings and motion sensing events to a Blynk app or Blynk-connected devices like microcontrollers.
 
+### Sample Blynk UI
+<img src="https://github.com/mmichon/ring-blynk/blob/master/sample_blynk_ui.jpeg?raw=true" width=300>
+
 ### Features
 * Responds to Ring 'ding' and motion events
 * Sets the state of a button in a Blynk app which shows whether the Ring doorbell has been rung recently
